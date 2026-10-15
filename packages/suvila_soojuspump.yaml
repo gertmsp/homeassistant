@@ -1,0 +1,127 @@
+# Suvila soojuspump – hinnapõhine juhtimine (v2)
+# Pane fail: /config/packages/suvila_soojuspump.yaml
+# configuration.yaml-is peab olema:
+#   homeassistant:
+#     packages: !include_dir_named packages
+
+input_boolean:
+  suvila_hinnajuhtimine:
+    name: "Suvila hinnapõhine juhtimine"
+    icon: mdi:heat-pump
+
+input_number:
+  suvila_tunde_paevas:
+    name: "Suvila tööaeg päevas (h)"
+    min: 1
+    max: 24
+    step: 1
+    mode: slider
+    icon: mdi:clock-outline
+  suvila_temp_too:
+    name: "Suvila töörežiimi temp (°C)"
+    min: 8
+    max: 24
+    step: 0.5
+    mode: box
+  suvila_temp_ootel:
+    name: "Suvila külmakaitse temp (°C)"
+    min: 5
+    max: 15
+    step: 0.5
+    mode: box
+
+template:
+  # 1) Arvuta päeva N odavaimat TUNDI (15-min hinnad keskmistatakse tunniks)
+  - triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: state
+        entity_id: sensor.nordpool_mwh_ee_eur_3_10_0   # muutub iga perioodiga, ka keskööl
+      - trigger: state
+        entity_id: input_number.suvila_tunde_paevas
+      - trigger: time_pattern
+        minutes: 0
+    actions:
+      - variables:
+          hours: >
+            {% set raw = state_attr('sensor.nordpool_mwh_ee_eur_3_10_0', 'raw_today') or [] %}
+            {% set n = states('input_number.suvila_tunde_paevas') | int(0) %}
+            {% set ns = namespace(pairs=[]) %}
+            {% for h in range(24) %}
+              {% set acc = namespace(sum=0, cnt=0) %}
+              {% for e in raw %}
+                {% set s = e.start if e.start is datetime else as_datetime(e.start) %}
+                {% if s is not none and as_local(s).hour == h and e.value is number %}
+                  {% set acc.sum = acc.sum + e.value %}
+                  {% set acc.cnt = acc.cnt + 1 %}
+                {% endif %}
+              {% endfor %}
+              {% if acc.cnt > 0 %}
+                {% set ns.pairs = ns.pairs + [{'hour': h, 'price': acc.sum / acc.cnt}] %}
+              {% endif %}
+            {% endfor %}
+            {{ (ns.pairs | sort(attribute='price'))[:n] | map(attribute='hour') | sort | list }}
+    sensor:
+      - name: "Suvila odavaimad tunnid"
+        unique_id: suvila_odavaimad_tunnid
+        icon: mdi:clock-check-outline
+        state: >
+          {% if hours | count == 0 %}hinnad puuduvad{% else %}
+          {%- for h in hours %}{{ '%02d:00' | format(h) }}{{ ', ' if not loop.last }}{% endfor -%}
+          {% endif %}
+        attributes:
+          hours: "{{ hours }}"
+
+  # 2) Kas praegu on odav tund? (uueneb iga minut)
+  - binary_sensor:
+      - name: "Suvila odav tund"
+        unique_id: suvila_odav_tund
+        icon: mdi:cash-clock
+        state: >
+          {{ now().hour in (state_attr('sensor.suvila_odavaimad_tunnid', 'hours') or []) }}
+
+automation:
+  - id: suvila_soojuspump_hinnajuhtimine
+    alias: "Suvila soojuspump: hinnapõhine juhtimine"
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.suvila_odav_tund
+      - trigger: state
+        entity_id:
+          - input_boolean.suvila_hinnajuhtimine
+          - input_number.suvila_temp_too
+          - input_number.suvila_temp_ootel
+      - trigger: homeassistant
+        event: start
+      # Kinnita seadistus iga 30 min järel uuesti (kui käsk kadus või keegi muutis pulti)
+      - trigger: time_pattern
+        minutes: "/30"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.suvila_hinnajuhtimine
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: climate.sauna_soojuspump
+            state: unavailable
+    actions:
+      - variables:
+          target: >
+            {% if is_state('binary_sensor.suvila_odav_tund', 'on') %}
+              {{ states('input_number.suvila_temp_too') | float(16) }}
+            {% else %}
+              {{ states('input_number.suvila_temp_ootel') | float(10) }}
+            {% endif %}
+      # Muuda ainult siis, kui midagi on vaja muuta (ei piiksuta pumpa asjata)
+      - condition: template
+        value_template: >
+          {{ not is_state('climate.sauna_soojuspump', 'heat')
+             or state_attr('climate.sauna_soojuspump', 'temperature') | float(0) != target | float }}
+      - action: climate.set_temperature
+        target:
+          entity_id: climate.sauna_soojuspump
+        data:
+          hvac_mode: heat
+          temperature: "{{ target }}"

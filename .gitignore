@@ -1,0 +1,16 @@
+# Ignoreeri kõike
+/*
+
+# Luba ainult konfiguratsioon
+!/.gitignore
+!/README.md
+!/configuration.yaml
+!/automations.yaml
+!/scripts.yaml
+!/scenes.yaml
+!/packages/
+!/blueprints/
+!/themes/
+
+# Mitte kunagi
+secrets.yaml
