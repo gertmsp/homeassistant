@@ -1,0 +1,251 @@
+# Soojuspump tsükkelautomaatika – kõrge lae õhu segamine
+# Fail: /config/packages/soojuspump_tsukkel.yaml
+#
+# Probleem: pump asub kõrgel, soe õhk koguneb lakke.
+# Lahendus: Shelly andur 1m kõrgusel juhib pumba HEAT/FAN tsüklit.
+#
+# Loogika:
+#   Kui Shelly < (HA_temp - hüsterees)  → HEAT režiim, setpoint = HA_temp + vahe
+#   Kui pumba_temp >= setpoint           → FAN režiim (sega õhku, min kestus)
+#   Kui pumba_temp < (setpoint - 2°)    → tagasi HEAT
+#   Kui Shelly >= (HA_temp + hüsterees) → pump OFF
+
+input_boolean:
+  soojuspump_auto:
+    name: "Soojuspump - Automaatika"
+    icon: mdi:thermostat-auto
+
+input_number:
+  ha_temperatuur:
+    name: "HA Temperatuur (sihttemperatuur)"
+    min: 15
+    max: 30
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: mdi:home-thermometer
+
+  temp_vahe:
+    name: "Temperatuuri Vahe (pumba offset)"
+    min: 1
+    max: 10
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-plus
+    initial: 5
+
+  hysterees:
+    name: "Hüsterees"
+    min: 0.5
+    max: 3
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: mdi:sine-wave
+    initial: 1
+
+  heat_min_aeg:
+    name: "HEAT minimaalne kestus (min)"
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:timer
+    initial: 10
+
+  fan_min_aeg:
+    name: "FAN minimaalne kestus (min)"
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:timer-outline
+    initial: 10
+
+template:
+  - sensor:
+      - name: "Sauna soojuspump pumba temperatuur"
+        unique_id: sauna_soojuspump_pump_temp
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state_class: measurement
+        state: >
+          {{ state_attr('climate.sauna_soojuspump', 'current_temperature') }}
+
+      - name: "Sauna soojuspump target setpoint"
+        unique_id: sauna_soojuspump_target_setpoint
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state: >
+          {{ (states('input_number.ha_temperatuur') | float(0))
+           + (states('input_number.temp_vahe') | float(0)) }}
+
+      - name: "Sauna soojuspump automaatika staatus"
+        unique_id: sauna_soojuspump_auto_status
+        state: >
+          {% set auto = states('input_boolean.soojuspump_auto') %}
+          {% set shelly = states('sensor.shellyhtg3_80b54e37a160_temperature') | float(0) %}
+          {% set ha_temp = states('input_number.ha_temperatuur') | float(0) %}
+          {% set hyst = states('input_number.hysterees') | float(0) %}
+          {% if auto == 'off' %}
+            Manuaal
+          {% elif shelly < (ha_temp - hyst) %}
+            Küttmine vajalik
+          {% elif shelly >= (ha_temp + hyst) %}
+            Sihttemperatuur saavutatud
+          {% else %}
+            Hüstereesi vahemik
+          {% endif %}
+
+automation:
+  - id: soojuspump_start_heat
+    alias: "Soojuspump - Käivita HEAT režiim"
+    description: "Kui Shelly temp on madal ja automaatika on sees, käivita HEAT režiim."
+    trigger:
+      - trigger: state
+        entity_id:
+          - sensor.shellyhtg3_80b54e37a160_temperature
+          - input_number.ha_temperatuur
+          - input_number.hysterees
+          - input_boolean.soojuspump_auto
+    condition:
+      - condition: state
+        entity_id: input_boolean.soojuspump_auto
+        state: "on"
+      - condition: template
+        value_template: >
+          {{ (states('sensor.shellyhtg3_80b54e37a160_temperature') | float(0))
+           < ((states('input_number.ha_temperatuur') | float(0))
+           - (states('input_number.hysterees') | float(0))) }}
+      - condition: template
+        value_template: >
+          {{ states('climate.sauna_soojuspump') != 'heat' }}
+    action:
+      - action: climate.set_hvac_mode
+        target:
+          entity_id: climate.sauna_soojuspump
+        data:
+          hvac_mode: heat
+      - action: climate.set_temperature
+        target:
+          entity_id: climate.sauna_soojuspump
+        data:
+          temperature: >
+            {{ (states('input_number.ha_temperatuur') | float(0))
+             + (states('input_number.temp_vahe') | float(0)) }}
+      - delay:
+          minutes: "{{ states('input_number.heat_min_aeg') | int(10) }}"
+    mode: single
+
+  - id: soojuspump_switch_to_fan
+    alias: "Soojuspump - Lülita FAN režiimile"
+    description: "Pump on kütnud piisavalt, kuid Shelly temp on veel madal. Lülita FAN."
+    trigger:
+      - trigger: template
+        value_template: >
+          {% set pump_temp = state_attr('climate.sauna_soojuspump', 'current_temperature') | float(0) %}
+          {% set setpoint = (states('input_number.ha_temperatuur') | float(0))
+                          + (states('input_number.temp_vahe') | float(0)) %}
+          {{ pump_temp >= setpoint and setpoint > 0 }}
+    condition:
+      - condition: state
+        entity_id: input_boolean.soojuspump_auto
+        state: "on"
+      - condition: state
+        entity_id: climate.sauna_soojuspump
+        state: heat
+      - condition: template
+        value_template: >
+          {{ (states('sensor.shellyhtg3_80b54e37a160_temperature') | float(0))
+           < ((states('input_number.ha_temperatuur') | float(0))
+           - (states('input_number.hysterees') | float(0))) }}
+    action:
+      - action: climate.set_hvac_mode
+        target:
+          entity_id: climate.sauna_soojuspump
+        data:
+          hvac_mode: fan_only
+      - delay:
+          minutes: "{{ states('input_number.fan_min_aeg') | int(10) }}"
+    mode: single
+
+  - id: soojuspump_fan_back_to_heat
+    alias: "Soojuspump - FAN→HEAT (pump jahtus)"
+    description: "Pump on FAN režiimis ja pumba termomeeter on langenud - aeg uuesti kütta."
+    trigger:
+      - trigger: template
+        value_template: >
+          {% set pump_temp = state_attr('climate.sauna_soojuspump', 'current_temperature') | float(0) %}
+          {% set setpoint = (states('input_number.ha_temperatuur') | float(0))
+                          + (states('input_number.temp_vahe') | float(0)) %}
+          {{ pump_temp < (setpoint - 2) and setpoint > 0 }}
+    condition:
+      - condition: state
+        entity_id: input_boolean.soojuspump_auto
+        state: "on"
+      - condition: state
+        entity_id: climate.sauna_soojuspump
+        state: fan_only
+      - condition: template
+        value_template: >
+          {{ (states('sensor.shellyhtg3_80b54e37a160_temperature') | float(0))
+           < ((states('input_number.ha_temperatuur') | float(0))
+           - (states('input_number.hysterees') | float(0))) }}
+    action:
+      - action: climate.set_hvac_mode
+        target:
+          entity_id: climate.sauna_soojuspump
+        data:
+          hvac_mode: heat
+      - action: climate.set_temperature
+        target:
+          entity_id: climate.sauna_soojuspump
+        data:
+          temperature: >
+            {{ (states('input_number.ha_temperatuur') | float(0))
+             + (states('input_number.temp_vahe') | float(0)) }}
+      - delay:
+          minutes: "{{ states('input_number.heat_min_aeg') | int(10) }}"
+    mode: single
+
+  - id: soojuspump_turn_off
+    alias: "Soojuspump - Lülita välja (sihttemperatuur saavutatud)"
+    description: "Shelly temperatuur on saavutanud soovitud taseme. Lülita pump välja."
+    trigger:
+      - trigger: state
+        entity_id:
+          - sensor.shellyhtg3_80b54e37a160_temperature
+          - input_number.ha_temperatuur
+          - input_number.hysterees
+    condition:
+      - condition: state
+        entity_id: input_boolean.soojuspump_auto
+        state: "on"
+      - condition: template
+        value_template: >
+          {{ (states('sensor.shellyhtg3_80b54e37a160_temperature') | float(0))
+           >= ((states('input_number.ha_temperatuur') | float(0))
+           + (states('input_number.hysterees') | float(0))) }}
+      - condition: template
+        value_template: >
+          {{ states('climate.sauna_soojuspump') in ['heat', 'fan_only'] }}
+    action:
+      - action: climate.set_hvac_mode
+        target:
+          entity_id: climate.sauna_soojuspump
+        data:
+          hvac_mode: "off"
+    mode: single
+
+  - id: soojuspump_auto_off
+    alias: "Soojuspump - Automaatika välja"
+    description: "Kui automaatika lülitatakse välja, kuvatakse teavitus."
+    trigger:
+      - trigger: state
+        entity_id: input_boolean.soojuspump_auto
+        to: "off"
+    action:
+      - action: persistent_notification.create
+        data:
+          title: "Soojuspump"
+          message: "Automaatika on välja lülitatud. Pump jääb manuaalsesse juhtimisse."
+          notification_id: soojuspump_auto_notification
+    mode: single
